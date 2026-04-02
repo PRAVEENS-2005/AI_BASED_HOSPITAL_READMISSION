@@ -146,8 +146,8 @@ def prepare_data(df: pd.DataFrame):
     ])
 
     rf_classifier = RandomForestClassifier(
-        n_estimators=200,
-        max_depth=20,
+        n_estimators=50,
+        max_depth=10,
         min_samples_split=5,
         min_samples_leaf=2,
         max_features="sqrt",
