@@ -1,21 +1,19 @@
 """
-main_pickle.py
---------------
+app/main.py
+-----------
 Lightweight FastAPI app for Render.
 Loads a pre-trained model_bundle.pkl — NO training happens here.
 
 Environment variables:
     MODEL_BUNDLE_PATH   path to the pickle file (default: ./model_bundle.pkl)
 
-Run locally:
-    uvicorn main_pickle:app --reload
-
-Deploy on Render:
-    Start command:  uvicorn main_pickle:app --host 0.0.0.0 --port $PORT
+Render start command:
+    uvicorn app.main:app --host 0.0.0.0 --port $PORT
 """
 
 import os
 import pickle
+import traceback
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -23,6 +21,10 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
 MODEL_BUNDLE_PATH = os.getenv("MODEL_BUNDLE_PATH", "./model_bundle.pkl")
 
@@ -35,12 +37,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global state — populated once at startup
 STATE: Dict[str, Any] = {}
 
 
 # ---------------------------------------------------------------------------
-# Pydantic schema (same as before)
+# Pydantic schema
 # ---------------------------------------------------------------------------
 
 class PredictionRequest(BaseModel):
@@ -111,7 +112,28 @@ FEATURE_LABELS = {
     "max_glu_serum": "Max Glucose Serum",
     "A1Cresult": "HbA1c Result",
     "metformin": "Metformin",
+    "repaglinide": "Repaglinide",
+    "nateglinide": "Nateglinide",
+    "chlorpropamide": "Chlorpropamide",
+    "glimepiride": "Glimepiride",
+    "acetohexamide": "Acetohexamide",
+    "glipizide": "Glipizide",
+    "glyburide": "Glyburide",
+    "tolbutamide": "Tolbutamide",
+    "pioglitazone": "Pioglitazone",
+    "rosiglitazone": "Rosiglitazone",
+    "acarbose": "Acarbose",
+    "miglitol": "Miglitol",
+    "troglitazone": "Troglitazone",
+    "tolazamide": "Tolazamide",
+    "examide": "Examide",
+    "citoglipton": "Citoglipton",
     "insulin": "Insulin",
+    "glyburide-metformin": "Glyburide-Metformin",
+    "glipizide-metformin": "Glipizide-Metformin",
+    "glimepiride-pioglitazone": "Glimepiride-Pioglitazone",
+    "metformin-rosiglitazone": "Metformin-Rosiglitazone",
+    "metformin-pioglitazone": "Metformin-Pioglitazone",
     "change": "Medication Change",
     "diabetesMed": "On Diabetes Medication",
 }
@@ -151,7 +173,11 @@ def explain_prediction(input_df: pd.DataFrame) -> List[Dict[str, Any]]:
         "encoded_value": row,
     })
     df_exp["contribution"] = df_exp["importance"] * (df_exp["encoded_value"] != 0).astype(float)
-    top3 = df_exp[df_exp["contribution"] > 0].sort_values("contribution", ascending=False).head(3)
+    top3 = (
+        df_exp[df_exp["contribution"] > 0]
+        .sort_values("contribution", ascending=False)
+        .head(3)
+    )
     return [
         {
             "feature": r["feature"],
@@ -165,10 +191,8 @@ def explain_prediction(input_df: pd.DataFrame) -> List[Dict[str, Any]]:
 
 
 def align_input(payload: PredictionRequest) -> pd.DataFrame:
-    """Turn request payload into a DataFrame with the same columns the model was trained on."""
     row = payload.model_dump(by_alias=True, exclude_none=False)
     input_df = pd.DataFrame([row])
-    # Add any missing columns (model expects them; fill with NaN)
     for col in STATE["X_columns"]:
         if col not in input_df.columns:
             input_df[col] = np.nan
@@ -176,25 +200,66 @@ def align_input(payload: PredictionRequest) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Startup — load pickle ONCE
+# Startup — load pickle ONCE, log everything for debugging
 # ---------------------------------------------------------------------------
 
 @app.on_event("startup")
 def startup_event():
     global STATE
-    if not os.path.exists(MODEL_BUNDLE_PATH):
-        raise RuntimeError(
-            f"Model bundle not found at '{MODEL_BUNDLE_PATH}'. "
-            "Run train_and_save.py locally and upload the resulting pickle."
-        )
-    print(f"Loading model bundle from {MODEL_BUNDLE_PATH} ...")
-    with open(MODEL_BUNDLE_PATH, "rb") as f:
-        STATE = pickle.load(f)
-    print("Model loaded. Ready to serve.")
+
+    # --- debug info so we can see paths in Render logs ---
+    cwd = os.getcwd()
+    print(f"[startup] CWD: {cwd}")
+    print(f"[startup] Files in CWD: {os.listdir(cwd)}")
+
+    app_dir = os.path.join(cwd, "app")
+    if os.path.exists(app_dir):
+        print(f"[startup] Files in app/: {os.listdir(app_dir)}")
+    else:
+        print("[startup] No 'app' subdirectory found.")
+
+    print(f"[startup] MODEL_BUNDLE_PATH = '{MODEL_BUNDLE_PATH}'")
+    print(f"[startup] Absolute path     = '{os.path.abspath(MODEL_BUNDLE_PATH)}'")
+    print(f"[startup] File exists?       {os.path.exists(MODEL_BUNDLE_PATH)}")
+
+    try:
+        if not os.path.exists(MODEL_BUNDLE_PATH):
+            # Try common fallback locations
+            fallbacks = [
+                "./app/model_bundle.pkl",
+                "/app/model_bundle.pkl",
+                os.path.join(cwd, "model_bundle.pkl"),
+                os.path.join(cwd, "app", "model_bundle.pkl"),
+            ]
+            found = None
+            for fb in fallbacks:
+                print(f"[startup] Trying fallback: {fb} → exists={os.path.exists(fb)}")
+                if os.path.exists(fb):
+                    found = fb
+                    break
+
+            if found is None:
+                raise RuntimeError(
+                    f"model_bundle.pkl not found at '{MODEL_BUNDLE_PATH}' "
+                    f"or any fallback. Make sure it is committed to your repo."
+                )
+            print(f"[startup] Found pkl at fallback: {found}")
+            pkl_path = found
+        else:
+            pkl_path = MODEL_BUNDLE_PATH
+
+        print(f"[startup] Loading model from: {pkl_path}")
+        with open(pkl_path, "rb") as f:
+            STATE = pickle.load(f)
+        print("[startup] Model loaded successfully. Ready to serve ✓")
+
+    except Exception:
+        traceback.print_exc()
+        raise  # re-raise so Render marks the deploy as failed
 
 
 # ---------------------------------------------------------------------------
-# Routes — identical contract to the original API
+# Routes
 # ---------------------------------------------------------------------------
 
 @app.get("/health")
@@ -262,11 +327,13 @@ def predict(payload: PredictionRequest):
 def explain_test_sample(sample_index: int):
     X_sample  = STATE["X_test_sample"]
     y_sample  = STATE["y_test_sample"]
-    probs     = STATE["probs_sample"]
     threshold = float(STATE["metrics"]["threshold"])
 
     if sample_index < 0 or sample_index >= len(X_sample):
-        raise HTTPException(status_code=404, detail=f"sample_index must be 0–{len(X_sample)-1}")
+        raise HTTPException(
+            status_code=404,
+            detail=f"sample_index must be between 0 and {len(X_sample) - 1}"
+        )
 
     row  = X_sample.iloc[[sample_index]]
     prob = float(STATE["model"].predict_proba(row)[0, 1])
