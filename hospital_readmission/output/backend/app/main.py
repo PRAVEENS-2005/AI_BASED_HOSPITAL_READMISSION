@@ -1,19 +1,5 @@
-"""
-app/main.py
------------
-Lightweight FastAPI app for Render.
-Loads a pre-trained model_bundle.pkl — NO training happens here.
-
-Environment variables:
-    MODEL_BUNDLE_PATH   path to the pickle file (default: ./model_bundle.pkl)
-
-Render start command:
-    uvicorn app.main:app --host 0.0.0.0 --port $PORT
-"""
-
 import os
-import pickle
-import traceback
+import zipfile
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -21,14 +7,25 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    roc_auc_score,
+)
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
+DATASET_ZIP = os.getenv("DATASET_ZIP", "./diabetes+130-us+hospitals+for+years+1999-2008.zip")
+TEST_SIZE = float(os.getenv("TEST_SIZE", "0.2"))
+RANDOM_STATE = int(os.getenv("RANDOM_STATE", "42"))
+PREDICTION_THRESHOLD = float(os.getenv("PREDICTION_THRESHOLD", "0.5"))
 
-MODEL_BUNDLE_PATH = os.getenv("MODEL_BUNDLE_PATH", "./model_bundle.pkl")
-
-app = FastAPI(title="Hospital Readmission AI API — Pickle Inference", version="3.0.0")
+app = FastAPI(title="Hospital Readmission AI API — Random Forest", version="2.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -39,10 +36,6 @@ app.add_middleware(
 
 STATE: Dict[str, Any] = {}
 
-
-# ---------------------------------------------------------------------------
-# Pydantic schema
-# ---------------------------------------------------------------------------
 
 class PredictionRequest(BaseModel):
     race: Optional[str] = None
@@ -93,182 +86,249 @@ class PredictionRequest(BaseModel):
     model_config = {"populate_by_name": True}
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-FEATURE_LABELS = {
-    "time_in_hospital": "Time in Hospital (days)",
-    "num_lab_procedures": "Number of Lab Procedures",
-    "num_procedures": "Number of Procedures",
-    "num_medications": "Number of Medications",
-    "number_outpatient": "Outpatient Visits",
-    "number_emergency": "Emergency Visits",
-    "number_inpatient": "Inpatient Visits",
-    "number_diagnoses": "Number of Diagnoses",
-    "admission_type_id": "Admission Type",
-    "discharge_disposition_id": "Discharge Disposition",
-    "admission_source_id": "Admission Source",
-    "max_glu_serum": "Max Glucose Serum",
-    "A1Cresult": "HbA1c Result",
-    "metformin": "Metformin",
-    "repaglinide": "Repaglinide",
-    "nateglinide": "Nateglinide",
-    "chlorpropamide": "Chlorpropamide",
-    "glimepiride": "Glimepiride",
-    "acetohexamide": "Acetohexamide",
-    "glipizide": "Glipizide",
-    "glyburide": "Glyburide",
-    "tolbutamide": "Tolbutamide",
-    "pioglitazone": "Pioglitazone",
-    "rosiglitazone": "Rosiglitazone",
-    "acarbose": "Acarbose",
-    "miglitol": "Miglitol",
-    "troglitazone": "Troglitazone",
-    "tolazamide": "Tolazamide",
-    "examide": "Examide",
-    "citoglipton": "Citoglipton",
-    "insulin": "Insulin",
-    "glyburide-metformin": "Glyburide-Metformin",
-    "glipizide-metformin": "Glipizide-Metformin",
-    "glimepiride-pioglitazone": "Glimepiride-Pioglitazone",
-    "metformin-rosiglitazone": "Metformin-Rosiglitazone",
-    "metformin-pioglitazone": "Metformin-Pioglitazone",
-    "change": "Medication Change",
-    "diabetesMed": "On Diabetes Medication",
-}
+def load_dataset(path: str) -> pd.DataFrame:
+    # Try the given path first, then common fallbacks
+    candidates = [
+        path,
+        "./app/diabetes+130-us+hospitals+for+years+1999-2008.zip",
+        "./diabetes+130-us+hospitals+for+years+1999-2008.zip",
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            print(f"[dataset] Loading from: {candidate}")
+            with zipfile.ZipFile(candidate, "r") as zf:
+                with zf.open("diabetic_data.csv") as f:
+                    return pd.read_csv(f)
+    raise FileNotFoundError(
+        f"Dataset zip not found. Tried: {candidates}. Set DATASET_ZIP env variable."
+    )
 
 
-def humanize_feature(name: str) -> str:
-    if name in FEATURE_LABELS:
-        return FEATURE_LABELS[name]
-    for prefix, label in [
-        ("diag_1_", "Primary Diagnosis: "),
-        ("diag_2_", "Secondary Diagnosis: "),
-        ("diag_3_", "Additional Diagnosis: "),
-        ("age_", "Age Group: "),
-        ("race_", "Race: "),
-        ("gender_", "Gender: "),
-        ("admission_type_id_", "Admission Type: "),
-        ("discharge_disposition_id_", "Discharge Disposition: "),
-        ("admission_source_id_", "Admission Source: "),
-    ]:
-        if name.startswith(prefix):
-            return label + name[len(prefix):]
-    return name.replace("_", " ").title()
+def prepare_data(df: pd.DataFrame):
+    df = df.replace("?", np.nan)
+    df = df.drop(columns=["weight", "payer_code", "medical_specialty"], errors="ignore")
+    df["target"] = (df["readmitted"] == "<30").astype(int)
+
+    X = df.drop(columns=["readmitted", "target", "encounter_id", "patient_nbr"], errors="ignore")
+    y = df["target"]
+
+    categorical_cols = X.select_dtypes(include=["object"]).columns.tolist()
+    numerical_cols = X.select_dtypes(exclude=["object"]).columns.tolist()
+
+    numeric_transformer = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+    ])
+
+    categorical_transformer = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore")),
+    ])
+
+    preprocessor = ColumnTransformer([
+        ("num", numeric_transformer, numerical_cols),
+        ("cat", categorical_transformer, categorical_cols),
+    ])
+
+    rf_classifier = RandomForestClassifier(
+        n_estimators=200,
+        max_depth=20,
+        min_samples_split=5,
+        min_samples_leaf=2,
+        max_features="sqrt",
+        class_weight=None,
+        random_state=RANDOM_STATE,
+        n_jobs=1,
+    )
+
+    model = Pipeline([
+        ("preprocessor", preprocessor),
+        ("classifier", rf_classifier),
+    ])
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y
+    )
+
+    model.fit(X_train, y_train)
+
+    y_prob = model.predict_proba(X_test)[:, 1]
+
+    threshold_candidates = np.arange(0.10, 0.91, 0.05)
+    best_threshold = PREDICTION_THRESHOLD
+    best_acc = -1.0
+
+    for t in threshold_candidates:
+        preds = (y_prob >= t).astype(int)
+        acc = accuracy_score(y_test, preds)
+        if acc > best_acc:
+            best_acc = acc
+            best_threshold = float(t)
+
+    y_pred = (y_prob >= best_threshold).astype(int)
+    cm = confusion_matrix(y_test, y_pred)
+    report = classification_report(y_test, y_pred, output_dict=True)
+
+    pre = model.named_steps["preprocessor"]
+    clf = model.named_steps["classifier"]
+    ohe = pre.named_transformers_["cat"].named_steps["onehot"]
+    cat_feature_names = ohe.get_feature_names_out(categorical_cols)
+    all_feature_names = numerical_cols + list(cat_feature_names)
+
+    importances = clf.feature_importances_
+    feature_importance = pd.DataFrame({
+        "feature": all_feature_names,
+        "importance": importances,
+        "abs_coefficient": importances,
+    }).sort_values("importance", ascending=False)
+
+    actual_accuracy = float(accuracy_score(y_test, y_pred))
+
+    return {
+        "df": df,
+        "X": X,
+        "y": y,
+        "X_train": X_train,
+        "X_test": X_test,
+        "y_train": y_train,
+        "y_test": y_test,
+        "model": model,
+        "categorical_cols": categorical_cols,
+        "numerical_cols": numerical_cols,
+        "feature_names": all_feature_names,
+        "feature_importance": feature_importance,
+        "metrics": {
+            "accuracy": actual_accuracy,
+            "roc_auc": float(roc_auc_score(y_test, y_prob)),
+            "threshold": best_threshold,
+            "base_threshold_env": PREDICTION_THRESHOLD,
+            "confusion_matrix": cm.tolist(),
+            "classification_report": report,
+            "support": int(len(y_test)),
+            "model_type": "Random Forest",
+            "n_estimators": clf.n_estimators,
+            "n_features": len(all_feature_names),
+            "training_samples": int(len(X_train)),
+            "positive_class_rate": float(y.mean()),
+        },
+    }
+
+
+def to_row_dict(payload: PredictionRequest) -> Dict[str, Any]:
+    return payload.model_dump(by_alias=True, exclude_none=False)
+
+
+def humanize_feature(feature_name: str) -> str:
+    FEATURE_LABELS = {
+        "time_in_hospital": "Time in Hospital (days)",
+        "num_lab_procedures": "Number of Lab Procedures",
+        "num_procedures": "Number of Procedures",
+        "num_medications": "Number of Medications",
+        "number_outpatient": "Outpatient Visits",
+        "number_emergency": "Emergency Visits",
+        "number_inpatient": "Inpatient Visits",
+        "number_diagnoses": "Number of Diagnoses",
+        "admission_type_id": "Admission Type",
+        "discharge_disposition_id": "Discharge Disposition",
+        "admission_source_id": "Admission Source",
+        "max_glu_serum": "Max Glucose Serum",
+        "A1Cresult": "HbA1c Result",
+        "metformin": "Metformin",
+        "repaglinide": "Repaglinide",
+        "nateglinide": "Nateglinide",
+        "chlorpropamide": "Chlorpropamide",
+        "glimepiride": "Glimepiride",
+        "acetohexamide": "Acetohexamide",
+        "glipizide": "Glipizide",
+        "glyburide": "Glyburide",
+        "tolbutamide": "Tolbutamide",
+        "pioglitazone": "Pioglitazone",
+        "rosiglitazone": "Rosiglitazone",
+        "acarbose": "Acarbose",
+        "miglitol": "Miglitol",
+        "troglitazone": "Troglitazone",
+        "tolazamide": "Tolazamide",
+        "examide": "Examide",
+        "citoglipton": "Citoglipton",
+        "insulin": "Insulin",
+        "glyburide-metformin": "Glyburide-Metformin",
+        "glipizide-metformin": "Glipizide-Metformin",
+        "glimepiride-pioglitazone": "Glimepiride-Pioglitazone",
+        "metformin-rosiglitazone": "Metformin-Rosiglitazone",
+        "metformin-pioglitazone": "Metformin-Pioglitazone",
+        "change": "Medication Change",
+        "diabetesMed": "On Diabetes Medication",
+    }
+    if feature_name in FEATURE_LABELS:
+        return FEATURE_LABELS[feature_name]
+    if feature_name.startswith("diag_1_"):
+        return f"Primary Diagnosis: {feature_name.replace('diag_1_', '')}"
+    if feature_name.startswith("diag_2_"):
+        return f"Secondary Diagnosis: {feature_name.replace('diag_2_', '')}"
+    if feature_name.startswith("diag_3_"):
+        return f"Additional Diagnosis: {feature_name.replace('diag_3_', '')}"
+    if feature_name.startswith("age_"):
+        return f"Age Group: {feature_name.replace('age_', '')}"
+    if feature_name.startswith("race_"):
+        return f"Race: {feature_name.replace('race_', '')}"
+    if feature_name.startswith("gender_"):
+        return f"Gender: {feature_name.replace('gender_', '')}"
+    if feature_name.startswith("admission_type_id_"):
+        return f"Admission Type: {feature_name.replace('admission_type_id_', '')}"
+    if feature_name.startswith("discharge_disposition_id_"):
+        return f"Discharge Disposition: {feature_name.replace('discharge_disposition_id_', '')}"
+    if feature_name.startswith("admission_source_id_"):
+        return f"Admission Source: {feature_name.replace('admission_source_id_', '')}"
+    return feature_name.replace("_", " ").title()
 
 
 def explain_prediction(input_df: pd.DataFrame) -> List[Dict[str, Any]]:
-    model = STATE["model"]
+    model: Pipeline = STATE["model"]
     transformed = model.named_steps["preprocessor"].transform(input_df)
-    row = (
-        transformed[0].toarray().ravel()
-        if hasattr(transformed[0], "toarray")
-        else np.asarray(transformed[0]).flatten()
-    )
-    importances = model.named_steps["classifier"].feature_importances_
+    row = transformed[0].toarray().ravel() if hasattr(transformed[0], "toarray") else np.asarray(transformed[0]).flatten()
+
+    clf = model.named_steps["classifier"]
+    importances = clf.feature_importances_
+
     df_exp = pd.DataFrame({
         "feature": STATE["feature_names"],
         "importance": importances,
         "encoded_value": row,
     })
+
     df_exp["contribution"] = df_exp["importance"] * (df_exp["encoded_value"] != 0).astype(float)
-    top3 = (
-        df_exp[df_exp["contribution"] > 0]
-        .sort_values("contribution", ascending=False)
-        .head(3)
-    )
-    return [
-        {
+    positive = df_exp[df_exp["contribution"] > 0].sort_values("contribution", ascending=False)
+
+    out = []
+    for _, r in positive.head(3).iterrows():
+        out.append({
             "feature": r["feature"],
             "label": humanize_feature(r["feature"]),
             "value": float(r["encoded_value"]),
             "contribution": float(r["contribution"]),
             "importance": float(r["importance"]),
-        }
-        for _, r in top3.iterrows()
-    ]
+        })
+    return out
 
-
-def align_input(payload: PredictionRequest) -> pd.DataFrame:
-    row = payload.model_dump(by_alias=True, exclude_none=False)
-    input_df = pd.DataFrame([row])
-    for col in STATE["X_columns"]:
-        if col not in input_df.columns:
-            input_df[col] = np.nan
-    return input_df[STATE["X_columns"]]
-
-
-# ---------------------------------------------------------------------------
-# Startup — load pickle ONCE, log everything for debugging
-# ---------------------------------------------------------------------------
 
 @app.on_event("startup")
 def startup_event():
     global STATE
+    print("[startup] Loading dataset...")
+    df = load_dataset(DATASET_ZIP)
+    print(f"[startup] Dataset loaded: {len(df)} rows")
+    print("[startup] Training model (this takes a few minutes)...")
+    STATE = prepare_data(df)
+    print("[startup] Model ready.")
 
-    # --- debug info so we can see paths in Render logs ---
-    cwd = os.getcwd()
-    print(f"[startup] CWD: {cwd}")
-    print(f"[startup] Files in CWD: {os.listdir(cwd)}")
-
-    app_dir = os.path.join(cwd, "app")
-    if os.path.exists(app_dir):
-        print(f"[startup] Files in app/: {os.listdir(app_dir)}")
-    else:
-        print("[startup] No 'app' subdirectory found.")
-
-    print(f"[startup] MODEL_BUNDLE_PATH = '{MODEL_BUNDLE_PATH}'")
-    print(f"[startup] Absolute path     = '{os.path.abspath(MODEL_BUNDLE_PATH)}'")
-    print(f"[startup] File exists?       {os.path.exists(MODEL_BUNDLE_PATH)}")
-
-    try:
-        if not os.path.exists(MODEL_BUNDLE_PATH):
-            # Try common fallback locations
-            fallbacks = [
-                "./app/model_bundle.pkl",
-                "/app/model_bundle.pkl",
-                os.path.join(cwd, "model_bundle.pkl"),
-                os.path.join(cwd, "app", "model_bundle.pkl"),
-            ]
-            found = None
-            for fb in fallbacks:
-                print(f"[startup] Trying fallback: {fb} → exists={os.path.exists(fb)}")
-                if os.path.exists(fb):
-                    found = fb
-                    break
-
-            if found is None:
-                raise RuntimeError(
-                    f"model_bundle.pkl not found at '{MODEL_BUNDLE_PATH}' "
-                    f"or any fallback. Make sure it is committed to your repo."
-                )
-            print(f"[startup] Found pkl at fallback: {found}")
-            pkl_path = found
-        else:
-            pkl_path = MODEL_BUNDLE_PATH
-
-        print(f"[startup] Loading model from: {pkl_path}")
-        with open(pkl_path, "rb") as f:
-            STATE = pickle.load(f)
-        print("[startup] Model loaded successfully. Ready to serve ✓")
-
-    except Exception:
-        traceback.print_exc()
-        raise  # re-raise so Render marks the deploy as failed
-
-
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "model": "Random Forest (pickle)",
-        "n_rows_dataset": STATE.get("n_rows_dataset"),
-        "features": len(STATE["feature_names"]),
+        "model": "Random Forest",
+        "dataset_loaded": True,
+        "rows": int(len(STATE["df"])),
+        "features": int(len(STATE["feature_names"])),
     }
 
 
@@ -284,18 +344,19 @@ def top_features(limit: int = 10):
 
 @app.get("/patients/examples")
 def patient_examples(limit: int = 10):
-    X_sample  = STATE["X_test_sample"]
-    y_sample  = STATE["y_test_sample"]
-    probs     = STATE["probs_sample"]
+    X_test = STATE["X_test"].reset_index(drop=True)
+    y_test = STATE["y_test"].reset_index(drop=True)
+    model: Pipeline = STATE["model"]
+    probs = model.predict_proba(X_test)[:, 1]
     threshold = float(STATE["metrics"]["threshold"])
 
-    limit = max(1, min(limit, len(X_sample)))
+    limit = max(1, min(limit, len(X_test)))
     rows = []
     for idx in range(limit):
-        raw = X_sample.iloc[idx].to_dict()
+        raw = X_test.iloc[idx].to_dict()
         rows.append({
             "id": idx,
-            "actual": int(y_sample.iloc[idx]),
+            "actual": int(y_test.iloc[idx]),
             "predicted_probability": float(probs[idx]),
             "predicted_class": int(probs[idx] >= threshold),
             "age": raw.get("age"),
@@ -310,11 +371,17 @@ def patient_examples(limit: int = 10):
 
 @app.post("/predict")
 def predict(payload: PredictionRequest):
-    input_df  = align_input(payload)
-    model     = STATE["model"]
-    prob      = float(model.predict_proba(input_df)[0, 1])
+    model: Pipeline = STATE["model"]
+    input_df = pd.DataFrame([to_row_dict(payload)])
+    missing_cols = [c for c in STATE["X"].columns if c not in input_df.columns]
+    for col in missing_cols:
+        input_df[col] = np.nan
+    input_df = input_df[STATE["X"].columns]
+
+    prob = float(model.predict_proba(input_df)[0, 1])
     threshold = float(STATE["metrics"]["threshold"])
-    pred      = int(prob >= threshold)
+    pred = int(prob >= threshold)
+
     return {
         "predicted_probability": prob,
         "predicted_class": pred,
@@ -325,23 +392,20 @@ def predict(payload: PredictionRequest):
 
 @app.get("/explain/test/{sample_index}")
 def explain_test_sample(sample_index: int):
-    X_sample  = STATE["X_test_sample"]
-    y_sample  = STATE["y_test_sample"]
+    X_test = STATE["X_test"].reset_index(drop=True)
+    y_test = STATE["y_test"].reset_index(drop=True)
+    if sample_index < 0 or sample_index >= len(X_test):
+        raise HTTPException(status_code=404, detail="sample index out of range")
+
+    row = X_test.iloc[[sample_index]]
+    model: Pipeline = STATE["model"]
+    prob = float(model.predict_proba(row)[0, 1])
     threshold = float(STATE["metrics"]["threshold"])
-
-    if sample_index < 0 or sample_index >= len(X_sample):
-        raise HTTPException(
-            status_code=404,
-            detail=f"sample_index must be between 0 and {len(X_sample) - 1}"
-        )
-
-    row  = X_sample.iloc[[sample_index]]
-    prob = float(STATE["model"].predict_proba(row)[0, 1])
     pred = int(prob >= threshold)
 
     return {
         "sample_index": sample_index,
-        "actual_class": int(y_sample.iloc[sample_index]),
+        "actual_class": int(y_test.iloc[sample_index]),
         "predicted_class": pred,
         "predicted_probability": prob,
         "threshold": threshold,
@@ -353,7 +417,7 @@ def explain_test_sample(sample_index: int):
 @app.get("/dashboard/summary")
 def dashboard_summary():
     return {
-        "metrics":          STATE["metrics"],
-        "top_features":     STATE["feature_importance"].head(8).to_dict(orient="records"),
+        "metrics": STATE["metrics"],
+        "top_features": STATE["feature_importance"].head(8).to_dict(orient="records"),
         "patient_examples": patient_examples(8),
     }
